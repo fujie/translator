@@ -1,0 +1,13 @@
+{
+  "openai_api_key": "sk-proj-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "realtime_model": "gpt-realtime",
+  "input_device": "",
+  "output_device": "",
+  "mic_passthrough_device": "",
+  "mic_translated_device": "BlackHole 16ch",
+  "speaker_capture_device": "BlackHole 2ch",
+  "log_max_entries": 200,
+  "source_language": "ja",
+  "target_language_mic": "en",
+  "target_language_speaker": "ja"
+}
