@@ -1,27 +1,15 @@
 """
-Translation log window — PyObjC / AppKit implementation.
+Translation log window — tkinter implementation (cross-platform).
 
-All UI lives on the main (AppKit) thread.
-Background pipeline threads call add_entry() which puts items in a queue.
-The main app's rumps Timer calls poll() to drain the queue and update the NSTextView.
+add_entry() is thread-safe and can be called from any pipeline thread.
+poll() must be called periodically from the tkinter main thread to drain
+the queue and update the text widget.
 """
 import datetime
 import queue
+import tkinter as tk
+from tkinter import ttk, filedialog
 from typing import Optional
-
-import objc
-from Foundation import NSObject, NSMakeRect
-from AppKit import (
-    NSWindow, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
-    NSWindowStyleMaskMiniaturizable, NSWindowStyleMaskResizable,
-    NSBackingStoreBuffered, NSTextView, NSScrollView, NSButton,
-    NSFont, NSApplication, NSSavePanel,
-)
-
-_STYLE = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-          NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
-_W, _H = 960, 520
-_BAR_H = 36  # height of button bar at bottom
 
 
 class LogEntry:
@@ -32,31 +20,14 @@ class LogEntry:
         self.timestamp = datetime.datetime.now().strftime("%H:%M:%S")
 
 
-class _Delegate(NSObject):
-    """NSObject helper — routes button actions back to LogWindow."""
-
-    def initWithOwner_(self, owner):
-        self = objc.super(_Delegate, self).init()
-        if self is None:
-            return None
-        self._owner = owner
-        return self
-
-    def clearLog_(self, sender):
-        self._owner._clear()
-
-    def exportLog_(self, sender):
-        self._owner._export()
-
-
 class LogWindow:
-    def __init__(self, max_entries: int = 200):
+    def __init__(self, root: tk.Tk, max_entries: int = 200):
+        self._root = root
         self.max_entries = max_entries
         self._entries: list[LogEntry] = []
         self._queue: queue.Queue = queue.Queue()
-        self._window: Optional[NSWindow] = None
-        self._text_view: Optional[NSTextView] = None
-        self._delegate: Optional[_Delegate] = None
+        self._window: Optional[tk.Toplevel] = None
+        self._text: Optional[tk.Text] = None
 
     # ------------------------------------------------------------------
     # Thread-safe — called from pipeline threads
@@ -70,27 +41,24 @@ class LogWindow:
         self._queue.put(entry)
 
     # ------------------------------------------------------------------
-    # Main-thread API — called by rumps callbacks / Timer
+    # Main-thread API
     # ------------------------------------------------------------------
 
     def show(self):
-        if self._window is None:
+        if self._window is None or not self._window.winfo_exists():
             self._build()
-        self._window.makeKeyAndOrderFront_(None)
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        else:
+            self._window.deiconify()
+            self._window.lift()
+            self._window.focus_force()
 
     def poll(self):
-        """Drain queue → append to NSTextView. Called by rumps Timer (main thread)."""
-        if self._text_view is None:
-            while not self._queue.empty():
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            return
+        """Drain queue → append to text widget. Call from main thread."""
         try:
             while True:
-                self._append(self._queue.get_nowait())
+                entry = self._queue.get_nowait()
+                if self._text:
+                    self._append(entry)
         except queue.Empty:
             pass
 
@@ -99,52 +67,43 @@ class LogWindow:
     # ------------------------------------------------------------------
 
     def _build(self):
-        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(200, 200, _W, _H), _STYLE, NSBackingStoreBuffered, False
+        self._window = tk.Toplevel(self._root)
+        self._window.title("Translation Log")
+        self._window.geometry("960x520")
+        self._window.protocol("WM_DELETE_WINDOW", self._window.withdraw)
+
+        # ── Text area ────────────────────────────────────────────────
+        text_frame = tk.Frame(self._window)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._text = tk.Text(
+            text_frame,
+            font=("Courier New", 11),
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
         )
-        self._window.setTitle_("Translation Log")
-        self._window.setReleasedWhenClosed_(False)
+        scrollbar = ttk.Scrollbar(text_frame, command=self._text.yview)
+        self._text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._delegate = _Delegate.alloc().initWithOwner_(self)
-        content = self._window.contentView()
+        # ── Button bar ────────────────────────────────────────────────
+        btn_frame = tk.Frame(self._window, pady=6)
+        btn_frame.pack(fill=tk.X, padx=8)
+        tk.Button(btn_frame, text="Clear", width=8,
+                  command=self._clear).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Export…", width=8,
+                  command=self._export).pack(side=tk.LEFT)
 
-        # ── Button bar (bottom strip) ────────────────────────────────
-        clear_btn = NSButton.alloc().initWithFrame_(NSMakeRect(8, 6, 72, 24))
-        clear_btn.setTitle_("Clear")
-        clear_btn.setBezelStyle_(1)  # NSBezelStyleRounded
-        clear_btn.setTarget_(self._delegate)
-        clear_btn.setAction_("clearLog:")
-        content.addSubview_(clear_btn)
-
-        export_btn = NSButton.alloc().initWithFrame_(NSMakeRect(86, 6, 80, 24))
-        export_btn.setTitle_("Export…")
-        export_btn.setBezelStyle_(1)
-        export_btn.setTarget_(self._delegate)
-        export_btn.setAction_("exportLog:")
-        content.addSubview_(export_btn)
-
-        # ── Scrollable text view (rest of the window) ─────────────────
-        sv_rect = NSMakeRect(0, _BAR_H, _W, _H - _BAR_H)
-        scroll = NSScrollView.alloc().initWithFrame_(sv_rect)
-        scroll.setHasVerticalScroller_(True)
-        scroll.setAutohidesScrollers_(True)
-        scroll.setBorderType_(2)              # NSBezelBorder
-        scroll.setAutoresizingMask_(2 | 16)   # widthSizable | heightSizable
-
-        self._text_view = NSTextView.alloc().initWithFrame_(sv_rect)
-        self._text_view.setEditable_(False)
-        self._text_view.setFont_(NSFont.fontWithName_size_("Menlo", 11))
-        self._text_view.setAutoresizingMask_(2 | 16)
-
-        scroll.setDocumentView_(self._text_view)
-        content.addSubview_(scroll)
-
-        # Replay history for newly created window
+        # Replay existing history into the new window
         for entry in list(self._entries):
             self._append(entry)
 
     def _append(self, entry: LogEntry):
-        if self._text_view is None:
+        if self._text is None:
             return
         arrow = "↑" if "local" in entry.direction else "↓"
         line = (
@@ -152,23 +111,29 @@ class LogWindow:
             f"{entry.original}\n"
             f"{'':>28}→  {entry.translated}\n\n"
         )
-        storage = self._text_view.textStorage()
-        storage.replaceCharactersInRange_withString_((storage.length(), 0), line)
-        self._text_view.scrollToEndOfDocument_(None)
+        self._text.configure(state=tk.NORMAL)
+        self._text.insert(tk.END, line)
+        self._text.see(tk.END)
+        self._text.configure(state=tk.DISABLED)
 
     def _clear(self):
         self._entries.clear()
-        if self._text_view:
-            storage = self._text_view.textStorage()
-            storage.replaceCharactersInRange_withString_((0, storage.length()), "")
+        if self._text:
+            self._text.configure(state=tk.NORMAL)
+            self._text.delete("1.0", tk.END)
+            self._text.configure(state=tk.DISABLED)
 
     def _export(self):
-        panel = NSSavePanel.savePanel()
-        fname = f"translation_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        panel.setNameFieldStringValue_(fname)
-        result = panel.runModal()
-        if result == 1:  # NSModalResponseOK
-            path = str(panel.URL().path())
+        path = filedialog.asksaveasfilename(
+            parent=self._window,
+            defaultextension=".txt",
+            initialfile=(
+                f"translation_log_"
+                f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            ),
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
             with open(path, "w", encoding="utf-8") as f:
                 for e in self._entries:
                     f.write(f"[{e.timestamp}] {e.direction}\n")

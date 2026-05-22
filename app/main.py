@@ -1,23 +1,28 @@
 """
-Menu bar app — PyObjC / AppKit throughout (no tkinter).
+Cross-platform system-tray app.
 
-All UI is created on the AppKit main thread.
-Pipeline threads communicate via thread-safe queues in LogWindow.
+pystray  → tray icon + menu  (Windows / macOS / Linux)
+tkinter  → Settings window, Log window, dialogs (built-in, no extra deps)
+
+Thread model
+------------
+  Main thread  : tkinter root.mainloop()
+  Tray thread  : pystray icon.run_detached()  (daemon)
+  Pipeline threads: MicPipeline / SpeakerPipeline (daemon)
+
+Tray callbacks fire on the pystray thread; they use root.after(0, fn)
+to dispatch safely to the tkinter main thread before touching any UI.
 """
 import json
 import logging
 import os
 import sys
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog
+from typing import Optional
 
-import objc
-import rumps
-from Foundation import NSObject, NSMakeRect
-from AppKit import (
-    NSWindow, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
-    NSBackingStoreBuffered,
-    NSTextField, NSSecureTextField, NSPopUpButton, NSButton,
-    NSFont, NSApplication, NSColor,
-)
+import pystray
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -34,255 +39,243 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
 
-_SETTINGS_STYLE = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-_W, _H = 540, 430
+_MODELS = [
+    "gpt-realtime",
+    "gpt-realtime-2",
+    "gpt-realtime-mini",
+    "gpt-realtime-translate",
+]
 
+
+# ── Config helpers ────────────────────────────────────────────────────
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
 def save_config(cfg: dict):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
-# ------------------------------------------------------------------
-# Settings window (PyObjC — runs on the AppKit main thread)
-# ------------------------------------------------------------------
+# ── Tray icon image ───────────────────────────────────────────────────
 
-class _SettingsController(NSObject):
-    """Manages the settings form window. Kept alive as a TranslateApp attribute."""
+def _make_icon(mic_on: bool = False, spk_on: bool = False) -> Image.Image:
+    """Draw a simple 64×64 icon; green when active, grey when idle."""
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if mic_on and spk_on:
+        color = (50, 180, 50, 255)    # both active → green
+    elif mic_on:
+        color = (50, 130, 220, 255)   # mic only → blue
+    elif spk_on:
+        color = (220, 130, 50, 255)   # speaker only → orange
+    else:
+        color = (120, 120, 120, 255)  # idle → grey
+    d.ellipse([6, 6, 58, 58], fill=color)
+    # small inner circle for depth
+    d.ellipse([20, 20, 44, 44], fill=(255, 255, 255, 60))
+    return img
 
-    def initWithConfig_devices_onSave_(self, config, devices, on_save):
-        self = objc.super(_SettingsController, self).init()
-        if self is None:
-            return None
+
+# ── Settings window ───────────────────────────────────────────────────
+
+class SettingsWindow:
+    """Modal settings form built with tkinter."""
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        config: dict,
+        devices: list[dict],
+        on_save,
+    ):
+        self._root = root
         self._config = config
-        self._devices = devices
         self._on_save = on_save
-        self._window = None
-        # Form field refs (set in _build)
-        self._api_field = None
-        self._model_popup = None
-        self._input_popup = None
-        self._output_popup = None
-        self._pt_popup = None
-        self._tr_popup = None
-        self._sp_popup = None
-        self._build()
-        return self
+        self._build(devices)
 
-    # ── UI construction ──────────────────────────────────────────────
+    def _build(self, devices: list[dict]):
+        win = tk.Toplevel(self._root)
+        win.title("Realtime Translate – Settings")
+        win.resizable(False, False)
+        win.grab_set()   # modal
 
-    def _build(self):
-        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(300, 300, _W, _H), _SETTINGS_STYLE, NSBackingStoreBuffered, False
-        )
-        self._window.setTitle_("Realtime Translate – Settings")
-        self._window.setReleasedWhenClosed_(False)
-
-        content = self._window.contentView()
-        row = _H - 50  # top → bottom layout
-
-        def label(text, y):
-            lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(16, y, 220, 20))
-            lbl.setStringValue_(text)
-            lbl.setEditable_(False)
-            lbl.setBordered_(False)
-            lbl.setDrawsBackground_(False)
-            lbl.setSelectable_(False)
-            content.addSubview_(lbl)
-
-        def secure_field(current, y):
-            fld = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(230, y, 290, 22))
-            fld.setStringValue_(current or "")
-            content.addSubview_(fld)
-            return fld
-
-        def popup(options, current, y):
-            pb = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(230, y - 2, 295, 26))
-            for opt in options:
-                pb.addItemWithTitle_(opt)
-            sel = current if current in options else options[0]
-            pb.selectItemWithTitle_(sel)
-            content.addSubview_(pb)
-            return pb
-
-        input_names = ["(default)"] + [
-            d["name"] for d in self._devices if d["max_input_channels"] > 0
+        input_names  = ["(default)"] + [
+            d["name"] for d in devices if d["max_input_channels"] > 0
         ]
         output_names = ["(default)"] + [
-            d["name"] for d in self._devices if d["max_output_channels"] > 0
+            d["name"] for d in devices if d["max_output_channels"] > 0
         ]
 
-        cfg = self._config
-        STEP = 46
-
-        label("OpenAI API Key:", row)
-        self._api_field = secure_field(cfg.get("openai_api_key", ""), row)
-        row -= STEP
-
-        _MODELS = [
-            "gpt-realtime-translate",
-            "gpt-realtime",
-            "gpt-realtime-2",
-            "gpt-realtime-mini",
-        ]
-        label("Realtime Model:", row)
-        self._model_popup = popup(
-            _MODELS, cfg.get("realtime_model", "gpt-realtime-translate"), row
-        )
-        row -= STEP
-
-        label("Real Microphone:", row)
-        self._input_popup = popup(
-            input_names, cfg.get("input_device") or "(default)", row
-        )
-        row -= STEP
-
-        label("Real Speaker:", row)
-        self._output_popup = popup(
-            output_names, cfg.get("output_device") or "(default)", row
-        )
-        row -= STEP
-
-        label("Virtual Mic A – pass-through:", row)
-        self._pt_popup = popup(
-            output_names, cfg.get("mic_passthrough_device", "BlackHole 2ch"), row
-        )
-        row -= STEP
-
-        label("Virtual Mic B – JP→EN:", row)
-        self._tr_popup = popup(
-            output_names, cfg.get("mic_translated_device", "BlackHole 16ch"), row
-        )
-        row -= STEP
-
-        label("Speaker Capture device:", row)
-        self._sp_popup = popup(
-            input_names, cfg.get("speaker_capture_device", "BlackHole 2ch"), row
-        )
-        row -= STEP + 4
-
-        # Buttons
-        cancel_btn = NSButton.alloc().initWithFrame_(NSMakeRect(_W - 196, 12, 80, 28))
-        cancel_btn.setTitle_("Cancel")
-        cancel_btn.setBezelStyle_(1)
-        cancel_btn.setTarget_(self)
-        cancel_btn.setAction_("cancelSettings:")
-        content.addSubview_(cancel_btn)
-
-        save_btn = NSButton.alloc().initWithFrame_(NSMakeRect(_W - 108, 12, 90, 28))
-        save_btn.setTitle_("Save")
-        save_btn.setBezelStyle_(1)
-        save_btn.setKeyEquivalent_("\r")
-        save_btn.setTarget_(self)
-        save_btn.setAction_("saveSettings:")
-        content.addSubview_(save_btn)
-
-        self._window.makeKeyAndOrderFront_(None)
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-
-    # ── Actions ──────────────────────────────────────────────────────
-
-    def saveSettings_(self, sender):
-        new_cfg = dict(self._config)
-        new_cfg["openai_api_key"]        = str(self._api_field.stringValue()).strip()
-        new_cfg["realtime_model"]         = str(self._model_popup.titleOfSelectedItem())
-        new_cfg["input_device"]           = self._popup_val(self._input_popup)
-        new_cfg["output_device"]          = self._popup_val(self._output_popup)
-        new_cfg["mic_passthrough_device"] = self._popup_val(self._pt_popup)
-        new_cfg["mic_translated_device"]  = self._popup_val(self._tr_popup)
-        new_cfg["speaker_capture_device"] = self._popup_val(self._sp_popup)
-        save_config(new_cfg)
-        self._on_save(new_cfg)
-        self._window.close()
-
-    def cancelSettings_(self, sender):
-        self._window.close()
-
-    @objc.python_method
-    def _popup_val(self, pb) -> str:
-        val = str(pb.titleOfSelectedItem())
-        return "" if val == "(default)" else val
-
-
-# ------------------------------------------------------------------
-# Menu bar app
-# ------------------------------------------------------------------
-
-class TranslateApp(rumps.App):
-    def __init__(self):
-        super().__init__("🌐", quit_button=None)
-
-        self.config = load_config()
-        self.log_window = LogWindow(max_entries=self.config.get("log_max_entries", 200))
-
-        self._mic_pipeline: MicPipeline | None = None
-        self._speaker_pipeline: SpeakerPipeline | None = None
-        self._mic_active = False
-        self._speaker_active = False
-        self._settings_ctrl: _SettingsController | None = None  # keep alive
-
-        self.mic_item     = rumps.MenuItem("🎙 Mic: OFF",     callback=self.toggle_mic)
-        self.speaker_item = rumps.MenuItem("🔊 Speaker: OFF", callback=self.toggle_speaker)
-
-        self.menu = [
-            self.mic_item,
-            self.speaker_item,
-            None,
-            rumps.MenuItem("Translation Log…", callback=self.open_log),
-            rumps.MenuItem("Settings…",        callback=self.open_settings),
-            None,
-            rumps.MenuItem("Quit",             callback=self.quit_app),
+        # (label, config_key, options_list_or_None, widget_type)
+        rows = [
+            ("OpenAI API Key",            "openai_api_key",        None,         "password"),
+            ("Realtime Model",            "realtime_model",        _MODELS,      "combo"),
+            ("Real Microphone",           "input_device",          input_names,  "combo"),
+            ("Real Speaker",              "output_device",         output_names, "combo"),
+            ("Virtual Mic A – pass-thru", "mic_passthrough_device",output_names, "combo"),
+            ("Virtual Mic B – translated","mic_translated_device", output_names, "combo"),
+            ("Speaker Capture device",    "speaker_capture_device",input_names,  "combo"),
         ]
 
-        # Poll log window queue 5× per second from main thread
-        self._poll_timer = rumps.Timer(self._poll_log, 0.2)
-        self._poll_timer.start()
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
 
-        if not self.config.get("openai_api_key"):
-            rumps.alert(
-                title="Setup Required",
-                message="Please open Settings… and enter your OpenAI API key.",
+        _vars: dict[str, tk.StringVar] = {}
+
+        for i, (label, key, options, kind) in enumerate(rows):
+            ttk.Label(frame, text=label + ":").grid(
+                row=i, column=0, sticky=tk.W, pady=5, padx=(0, 10)
             )
+            var = tk.StringVar()
+            if kind == "password":
+                current = self._config.get(key, "")
+                var.set(current or "")
+                entry = ttk.Entry(frame, textvariable=var, width=42, show="•")
+                entry.grid(row=i, column=1, sticky=tk.EW)
+            else:
+                current = self._config.get(key, "") or "(default)"
+                cb = ttk.Combobox(
+                    frame, textvariable=var,
+                    values=options, width=40, state="readonly",
+                )
+                cb.set(current if current in options else options[0])
+                cb.grid(row=i, column=1, sticky=tk.EW)
+            _vars[key] = var
+
+        frame.columnconfigure(1, weight=1)
+
+        # ── Buttons ──────────────────────────────────────────────────
+        btn_frame = ttk.Frame(win, padding=(16, 0, 16, 14))
+        btn_frame.pack(fill=tk.X)
+
+        def _save():
+            new_cfg = dict(self._config)
+            for k, v in _vars.items():
+                val = v.get().strip()
+                new_cfg[k] = "" if val == "(default)" else val
+            save_config(new_cfg)
+            self._on_save(new_cfg)
+            win.destroy()
+
+        ttk.Button(btn_frame, text="Cancel",
+                   command=win.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(btn_frame, text="Save",
+                   command=_save).pack(side=tk.RIGHT)
+
+        win.update_idletasks()
+        win.minsize(win.winfo_width(), win.winfo_height())
+
+
+# ── Main app ──────────────────────────────────────────────────────────
+
+class TranslateApp:
+    def __init__(self):
+        self.config = load_config()
+
+        self._mic_active = False
+        self._spk_active = False
+        self._mic_pipeline: Optional[MicPipeline] = None
+        self._spk_pipeline: Optional[SpeakerPipeline] = None
+
+        # Hidden tkinter root — all UI lives on this thread
+        self._root = tk.Tk()
+        self._root.withdraw()
+        self._root.title("Realtime Translate")
+
+        self.log_window = LogWindow(
+            self._root,
+            max_entries=self.config.get("log_max_entries", 200),
+        )
+
+        # Poll log queue 5× per second from main thread
+        self._root.after(200, self._poll_log)
+
+        # Build tray icon (pystray runs in its own daemon thread)
+        self._icon = pystray.Icon(
+            "Realtime Translate",
+            _make_icon(),
+            "Realtime Translate",
+            menu=self._build_menu(),
+        )
 
     # ------------------------------------------------------------------
-    # Pipeline control
+    # Tray menu
     # ------------------------------------------------------------------
 
-    def toggle_mic(self, _):
+    def _build_menu(self) -> pystray.Menu:
+        mic_label = "🎙 Mic: ON " if self._mic_active else "🎙 Mic: OFF"
+        spk_label = "🔊 Speaker: ON " if self._spk_active else "🔊 Speaker: OFF"
+        return pystray.Menu(
+            pystray.MenuItem(mic_label,          self._cb_toggle_mic),
+            pystray.MenuItem(spk_label,          self._cb_toggle_spk),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Translation Log…", self._cb_open_log),
+            pystray.MenuItem("Settings…",        self._cb_open_settings),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit",             self._cb_quit),
+        )
+
+    def _refresh_tray(self):
+        """Update icon image + menu labels. Must be called from main thread."""
+        self._icon.icon = _make_icon(self._mic_active, self._spk_active)
+        self._icon.menu = self._build_menu()
+
+    # ------------------------------------------------------------------
+    # Tray callbacks — pystray thread → dispatch to tkinter main thread
+    # ------------------------------------------------------------------
+
+    def _cb_toggle_mic(self, *_):
+        self._root.after(0, self._toggle_mic)
+
+    def _cb_toggle_spk(self, *_):
+        self._root.after(0, self._toggle_spk)
+
+    def _cb_open_log(self, *_):
+        self._root.after(0, self.log_window.show)
+
+    def _cb_open_settings(self, *_):
+        self._root.after(0, self._open_settings)
+
+    def _cb_quit(self, *_):
+        self._root.after(0, self._quit)
+
+    # ------------------------------------------------------------------
+    # Pipeline control (main thread)
+    # ------------------------------------------------------------------
+
+    def _toggle_mic(self):
         if self._mic_active:
             self._stop_mic()
         else:
             self._start_mic()
 
-    def toggle_speaker(self, _):
-        if self._speaker_active:
-            self._stop_speaker()
+    def _toggle_spk(self):
+        if self._spk_active:
+            self._stop_spk()
         else:
-            self._start_speaker()
+            self._start_spk()
 
     def _start_mic(self):
         if not self._require_api_key():
             return
         self._mic_pipeline = MicPipeline(
             api_key=self.config["openai_api_key"],
-            input_device_name=self.config.get("input_device") or "",
-            passthrough_device_name=self.config.get("mic_passthrough_device", "BlackHole 2ch"),
-            translated_device_name=self.config.get("mic_translated_device", "BlackHole 16ch"),
+            input_device_name=self.config.get("input_device", ""),
+            passthrough_device_name=self.config.get("mic_passthrough_device", ""),
+            translated_device_name=self.config.get("mic_translated_device", ""),
             on_transcript=self.log_window.add_entry,
             model=self.config.get("realtime_model", ""),
         )
         self._mic_pipeline.start()
         self._mic_active = True
-        self.mic_item.title = "🎙 Mic: ON"
-        self._update_icon()
+        self._refresh_tray()
 
     def _stop_mic(self):
         if self._mic_pipeline:
@@ -290,83 +283,91 @@ class TranslateApp(rumps.App):
             self._mic_pipeline.cleanup()
             self._mic_pipeline = None
         self._mic_active = False
-        self.mic_item.title = "🎙 Mic: OFF"
-        self._update_icon()
+        self._refresh_tray()
 
-    def _start_speaker(self):
+    def _start_spk(self):
         if not self._require_api_key():
             return
-        self._speaker_pipeline = SpeakerPipeline(
+        self._spk_pipeline = SpeakerPipeline(
             api_key=self.config["openai_api_key"],
-            capture_device_name=self.config.get("speaker_capture_device", "BlackHole 2ch"),
-            output_device_name=self.config.get("output_device") or "",
+            capture_device_name=self.config.get("speaker_capture_device", ""),
+            output_device_name=self.config.get("output_device", ""),
             on_transcript=self.log_window.add_entry,
             model=self.config.get("realtime_model", ""),
         )
-        self._speaker_pipeline.start()
-        self._speaker_active = True
-        self.speaker_item.title = "🔊 Speaker: ON"
-        self._update_icon()
+        self._spk_pipeline.start()
+        self._spk_active = True
+        self._refresh_tray()
 
-    def _stop_speaker(self):
-        if self._speaker_pipeline:
-            self._speaker_pipeline.stop()
-            self._speaker_pipeline.cleanup()
-            self._speaker_pipeline = None
-        self._speaker_active = False
-        self.speaker_item.title = "🔊 Speaker: OFF"
-        self._update_icon()
+    def _stop_spk(self):
+        if self._spk_pipeline:
+            self._spk_pipeline.stop()
+            self._spk_pipeline.cleanup()
+            self._spk_pipeline = None
+        self._spk_active = False
+        self._refresh_tray()
 
     def _require_api_key(self) -> bool:
         if not self.config.get("openai_api_key"):
-            rumps.alert("API key not set. Open Settings… to configure.")
+            messagebox.showerror(
+                "API Key Required",
+                "OpenAI API キーが設定されていません。\n"
+                "「Settings…」から設定してください。",
+            )
             return False
         return True
 
-    def _update_icon(self):
-        if self._mic_active and self._speaker_active:
-            self.title = "🌐●"
-        elif self._mic_active:
-            self.title = "🎙●"
-        elif self._speaker_active:
-            self.title = "🔊●"
-        else:
-            self.title = "🌐"
-
     # ------------------------------------------------------------------
-    # Menu callbacks (main thread)
+    # Settings
     # ------------------------------------------------------------------
 
-    def open_log(self, _):
-        self.log_window.show()
-
-    def open_settings(self, _):
-        def on_save(new_cfg):
-            self.config = new_cfg
-            was_mic     = self._mic_active
-            was_speaker = self._speaker_active
-            if was_mic:
-                self._stop_mic()
-            if was_speaker:
-                self._stop_speaker()
-            if was_mic:
-                self._start_mic()
-            if was_speaker:
-                self._start_speaker()
-
-        self._settings_ctrl = _SettingsController.alloc().initWithConfig_devices_onSave_(
-            dict(self.config),
+    def _open_settings(self):
+        SettingsWindow(
+            self._root,
+            self.config,
             list_devices(),
-            on_save,
+            self._on_settings_saved,
         )
 
-    def quit_app(self, _):
-        self._stop_mic()
-        self._stop_speaker()
-        rumps.quit_application()
+    def _on_settings_saved(self, new_cfg: dict):
+        self.config = new_cfg
+        was_mic = self._mic_active
+        was_spk = self._spk_active
+        if was_mic:
+            self._stop_mic()
+        if was_spk:
+            self._stop_spk()
+        if was_mic:
+            self._start_mic()
+        if was_spk:
+            self._start_spk()
 
-    def _poll_log(self, _):
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
+
+    def _poll_log(self):
         self.log_window.poll()
+        self._root.after(200, self._poll_log)
+
+    def _quit(self):
+        self._stop_mic()
+        self._stop_spk()
+        self._icon.stop()
+        self._root.quit()
+
+    def run(self):
+        if not self.config.get("openai_api_key"):
+            self._root.after(
+                200,
+                lambda: messagebox.showinfo(
+                    "Setup Required",
+                    "config/settings.json に OpenAI API キーを設定してください。\n\n"
+                    "トレイアイコンの「Settings…」から設定できます。",
+                ),
+            )
+        self._icon.run_detached()   # pystray in background thread
+        self._root.mainloop()       # tkinter on main thread
 
 
 if __name__ == "__main__":
