@@ -35,8 +35,8 @@ _W, _H = 540, 476  # +46 px for the extra Speaker Model row
 
 _MODELS = [
     "gpt-realtime-translate",
-    "gpt-realtime",
     "gpt-realtime-2",
+    "gpt-realtime",
     "gpt-realtime-mini",
 ]
 
@@ -136,7 +136,7 @@ class _SettingsController(NSObject):
 
         label("Speaker Model:", row)
         self._speaker_model_popup = popup(
-            _MODELS, cfg.get("speaker_model", "gpt-realtime"), row
+            _MODELS, cfg.get("speaker_model", "gpt-realtime-2"), row
         )
         row -= STEP
 

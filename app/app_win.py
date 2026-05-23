@@ -41,8 +41,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.
 
 _MODELS = [
     "gpt-realtime-translate",
-    "gpt-realtime",
     "gpt-realtime-2",
+    "gpt-realtime",
     "gpt-realtime-mini",
 ]
 
@@ -117,7 +117,7 @@ class SettingsWindow:
         rows = [
             ("OpenAI API Key",            "openai_api_key",        None,         "password", ""),
             ("Mic Model",                 "realtime_model",        _MODELS,      "combo",    "gpt-realtime-translate"),
-            ("Speaker Model",             "speaker_model",         _MODELS,      "combo",    "gpt-realtime"),
+            ("Speaker Model",             "speaker_model",         _MODELS,      "combo",    "gpt-realtime-2"),
             ("Real Microphone",           "input_device",          input_names,  "combo",    "(default)"),
             ("Real Speaker",              "output_device",         output_names, "combo",    "(default)"),
             ("Virtual Mic A – pass-thru", "mic_passthrough_device",output_names, "combo",    "(default)"),
