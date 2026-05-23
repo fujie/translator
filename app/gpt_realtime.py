@@ -1,11 +1,19 @@
 """
 GPT Realtime API client over WebSocket.
 
-Uses gpt-realtime (and variants) with the conversation session shape.
-Translation direction is controlled via the instructions (system prompt).
+Supports two distinct API shapes:
 
-Note: gpt-realtime-translate exists in the model list but its inference
-backend returns Invalid URL errors — do not use it.
+gpt-realtime (and variants without "translate"):
+  - Endpoint : wss://api.openai.com/v1/realtime
+  - Session  : instructions + VAD config + output_modalities
+  - Send     : input_audio_buffer.append
+  - Receive  : response.output_audio.delta / response.output_audio_transcript.done
+
+gpt-realtime-translate:
+  - Endpoint : wss://api.openai.com/v1/realtime/translations
+  - Session  : audio.output.language  (no instructions, no VAD)
+  - Send     : session.input_audio_buffer.append
+  - Receive  : session.output_audio.delta / session.output_transcript.delta
 """
 import asyncio
 import base64
@@ -22,12 +30,13 @@ _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 logger = logging.getLogger(__name__)
 
-REALTIME_BASE_URL = "wss://api.openai.com/v1/realtime"
+REALTIME_BASE_URL           = "wss://api.openai.com/v1/realtime"
+REALTIME_TRANSLATE_BASE_URL = "wss://api.openai.com/v1/realtime/translations"
 DEFAULT_MODEL = "gpt-realtime"
 SAMPLE_RATE = 24000
 CHANNELS = 1
 
-# ── System prompts ────────────────────────────────────────────────────────────
+# ── System prompts (gpt-realtime only) ───────────────────────────────────────
 
 MIC_SYSTEM_PROMPT = (
     "You are a real-time speech translator. "
@@ -45,8 +54,7 @@ SPEAKER_SYSTEM_PROMPT = (
     "Output only the audio. Do not add commentary or explanations."
 )
 
-# Keep these as aliases so existing imports don't break
-MIC_INSTRUCTIONS = MIC_SYSTEM_PROMPT
+MIC_INSTRUCTIONS     = MIC_SYSTEM_PROMPT
 SPEAKER_INSTRUCTIONS = SPEAKER_SYSTEM_PROMPT
 
 VAD_CONFIG = {
@@ -56,20 +64,36 @@ VAD_CONFIG = {
     "silence_duration_ms": 500,
 }
 
+# ── Target language for gpt-realtime-translate ────────────────────────────────
+# mic mode    : Japanese → English
+# speaker mode: English → Japanese
+_TRANSLATE_TARGET_LANG = {
+    "mic":     "en",
+    "speaker": "ja",
+}
+
+# Sentence-ending punctuation used to flush transcript buffers
+_SENTENCE_END = frozenset(".。!！?？\n")
+
+
+def _is_translate_model(model: str) -> bool:
+    """Return True when the model uses the translations endpoint."""
+    return bool(model) and "translate" in model.lower()
+
 
 class RealtimeSession:
     def __init__(
         self,
         api_key: str,
-        mode: str,           # "mic" | "speaker"
+        mode: str,                    # "mic" | "speaker"
         on_audio: Callable[[bytes], None],
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = DEFAULT_MODEL,
     ):
-        self.api_key = api_key
-        self.mode = mode
-        self.model = model
-        self.on_audio = on_audio
+        self.api_key      = api_key
+        self.mode         = mode
+        self.model        = model or DEFAULT_MODEL
+        self.on_audio     = on_audio
         self.on_transcript = on_transcript
         self._ws: Optional[ClientConnection] = None
         self._running = False
@@ -99,12 +123,18 @@ class RealtimeSession:
     # ------------------------------------------------------------------
 
     async def _connect_and_run(self):
-        url = f"{REALTIME_BASE_URL}?model={self.model}"
+        if _is_translate_model(self.model):
+            url = f"{REALTIME_TRANSLATE_BASE_URL}?model={self.model}"
+        else:
+            url = f"{REALTIME_BASE_URL}?model={self.model}"
+
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         while self._running:
             try:
-                async with websockets.connect(url, additional_headers=headers, ssl=_SSL_CTX) as ws:
+                async with websockets.connect(
+                    url, additional_headers=headers, ssl=_SSL_CTX
+                ) as ws:
                     self._ws = ws
                     logger.info(f"[{self.mode}] Connected (model={self.model})")
                     await self._configure_session(ws)
@@ -121,33 +151,69 @@ class RealtimeSession:
                 await asyncio.sleep(2)
 
     async def _configure_session(self, ws):
-        instructions = MIC_SYSTEM_PROMPT if self.mode == "mic" else SPEAKER_SYSTEM_PROMPT
-        # Both gpt-realtime and gpt-realtime-translate use the nested
-        # audio.input / audio.output structure — not flat input_audio_format etc.
-        session = {
-            "type": "realtime",
-            "output_modalities": ["audio"],
-            "instructions": instructions,
-            "audio": {
-                "input": {"turn_detection": VAD_CONFIG},
-                "output": {"format": {"type": "audio/pcm", "rate": SAMPLE_RATE}},
-            },
-        }
+        if _is_translate_model(self.model):
+            # gpt-realtime-translate: specify only the target output language
+            target_lang = _TRANSLATE_TARGET_LANG.get(self.mode, "en")
+            session = {
+                "audio": {
+                    "output": {
+                        "language": target_lang,
+                    }
+                }
+            }
+            logger.info(
+                f"[{self.mode}] translate mode → target_language={target_lang}"
+            )
+        else:
+            # gpt-realtime: full session config with instructions + VAD
+            instructions = (
+                MIC_SYSTEM_PROMPT if self.mode == "mic" else SPEAKER_SYSTEM_PROMPT
+            )
+            session = {
+                "type": "realtime",
+                "output_modalities": ["audio"],
+                "instructions": instructions,
+                "audio": {
+                    "input":  {"turn_detection": VAD_CONFIG},
+                    "output": {"format": {"type": "audio/pcm", "rate": SAMPLE_RATE}},
+                },
+            }
+
         msg = {"type": "session.update", "session": session}
-        logger.debug(f"[{self.mode}] session.update → {json.dumps(session, ensure_ascii=False)}")
+        logger.debug(
+            f"[{self.mode}] session.update → {json.dumps(session, ensure_ascii=False)}"
+        )
         await ws.send(json.dumps(msg))
 
     async def _send_loop(self, ws):
+        # gpt-realtime-translate uses "session.input_audio_buffer.append"
+        # gpt-realtime uses          "input_audio_buffer.append"
+        append_event = (
+            "session.input_audio_buffer.append"
+            if _is_translate_model(self.model)
+            else "input_audio_buffer.append"
+        )
+
         while self._running:
             try:
                 chunk = await asyncio.wait_for(self._send_queue.get(), timeout=0.1)
                 encoded = base64.b64encode(chunk).decode()
-                await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": encoded}))
+                await ws.send(json.dumps({"type": append_event, "audio": encoded}))
             except asyncio.TimeoutError:
                 continue
 
     async def _receive_loop(self, ws):
-        input_transcript = ""
+        if _is_translate_model(self.model):
+            await self._receive_loop_translate(ws)
+        else:
+            await self._receive_loop_realtime(ws)
+
+    # ------------------------------------------------------------------
+    # Receive loop: gpt-realtime
+    # ------------------------------------------------------------------
+
+    async def _receive_loop_realtime(self, ws):
+        input_transcript  = ""
         output_transcript = ""
 
         async for raw in ws:
@@ -161,37 +227,31 @@ class RealtimeSession:
             etype = event.get("type", "")
             logger.debug(f"[{self.mode}] ← {etype}")
 
-            # ── Audio output ──────────────────────────────────────────
-            # gpt-realtime uses response.output_audio.delta
             if etype in ("response.output_audio.delta", "response.audio.delta"):
                 audio_b64 = event.get("delta", "")
                 if audio_b64:
                     self.on_audio(base64.b64decode(audio_b64))
 
-            # ── Input transcript (user speech → text) ─────────────────
             elif etype == "conversation.item.input_audio_transcription.completed":
                 input_transcript = event.get("transcript", "")
 
-            # ── Output transcript (translated text) ───────────────────
-            # gpt-realtime uses response.output_audio_transcript.done
-            elif etype in ("response.output_audio_transcript.done", "response.audio_transcript.done"):
+            elif etype in (
+                "response.output_audio_transcript.done",
+                "response.audio_transcript.done",
+            ):
                 output_transcript = event.get("transcript", "")
                 self._emit_transcript(input_transcript, output_transcript)
                 input_transcript = output_transcript = ""
 
-            # ── Session ───────────────────────────────────────────────
             elif etype == "session.created":
                 logger.info(f"[{self.mode}] session.created OK")
 
             elif etype == "session.updated":
                 logger.info(f"[{self.mode}] session.updated OK")
 
-            # ── Errors ────────────────────────────────────────────────
             elif etype == "error":
-                err = event.get("error", event)
-                logger.error(f"[{self.mode}] API error: {err}")
+                logger.error(f"[{self.mode}] API error: {event.get('error', event)}")
 
-            # ── Ignored (verbose but normal) ──────────────────────────
             elif etype in (
                 "input_audio_buffer.speech_started",
                 "input_audio_buffer.speech_stopped",
@@ -211,10 +271,68 @@ class RealtimeSession:
                 "response.text.done",
                 "rate_limits.updated",
             ):
-                pass  # expected, no action needed
+                pass
 
             else:
                 logger.debug(f"[{self.mode}] unhandled event: {etype}")
+
+    # ------------------------------------------------------------------
+    # Receive loop: gpt-realtime-translate
+    # ------------------------------------------------------------------
+
+    async def _receive_loop_translate(self, ws):
+        input_transcript  = ""
+        output_transcript = ""
+
+        async for raw in ws:
+            if not self._running:
+                break
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type", "")
+            logger.debug(f"[{self.mode}] ← {etype}")
+
+            # ── Translated audio output ───────────────────────────────
+            if etype == "session.output_audio.delta":
+                audio_b64 = event.get("delta", "")
+                if audio_b64:
+                    self.on_audio(base64.b64decode(audio_b64))
+
+            # ── Translated text (output transcript) ───────────────────
+            elif etype == "session.output_transcript.delta":
+                delta = event.get("delta", "")
+                output_transcript += delta
+                # Flush on sentence boundary
+                if delta and delta[-1] in _SENTENCE_END:
+                    self._emit_transcript(input_transcript, output_transcript.strip())
+                    input_transcript = output_transcript = ""
+
+            # ── Source text (input transcript) ────────────────────────
+            elif etype == "session.input_transcript.delta":
+                input_transcript += event.get("delta", "")
+
+            # ── Session closed (flush any remaining transcript) ───────
+            elif etype == "session.closed":
+                logger.info(f"[{self.mode}] session.closed")
+                if input_transcript or output_transcript:
+                    self._emit_transcript(
+                        input_transcript.strip(), output_transcript.strip()
+                    )
+                    input_transcript = output_transcript = ""
+
+            elif etype in ("session.created", "session.updated"):
+                logger.info(f"[{self.mode}] {etype} OK")
+
+            elif etype == "error":
+                logger.error(f"[{self.mode}] API error: {event.get('error', event)}")
+
+            else:
+                logger.debug(f"[{self.mode}] unhandled event: {etype}")
+
+    # ------------------------------------------------------------------
 
     def _emit_transcript(self, original: str, translated: str):
         if self.on_transcript and (original or translated):

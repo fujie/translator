@@ -35,26 +35,17 @@ _W, _H = 540, 430
 
 _MODELS = [
     "gpt-realtime",
+    "gpt-realtime-translate",
     "gpt-realtime-2",
     "gpt-realtime-mini",
 ]
 
 
-_UNSUPPORTED_MODELS = {"gpt-realtime-translate"}
-
-
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = json.load(f)
-    else:
-        cfg = {}
-    # Migrate away from models that have no inference backend
-    if cfg.get("realtime_model") in _UNSUPPORTED_MODELS:
-        cfg["realtime_model"] = "gpt-realtime"
-        save_config(cfg)
-        logger.warning("realtime_model was unsupported; reset to gpt-realtime")
-    return cfg
+            return json.load(f)
+    return {}
 
 
 def save_config(cfg: dict):
