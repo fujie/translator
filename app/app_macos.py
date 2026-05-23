@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
 
 _SETTINGS_STYLE = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-_W, _H = 540, 430
+_W, _H = 540, 476  # +46 px for the extra Speaker Model row
 
 _MODELS = [
     "gpt-realtime-translate",
@@ -71,6 +71,7 @@ class _SettingsController(NSObject):
         self._window = None
         self._api_field = None
         self._model_popup = None
+        self._speaker_model_popup = None
         self._input_popup = None
         self._output_popup = None
         self._pt_popup = None
@@ -127,9 +128,15 @@ class _SettingsController(NSObject):
         self._api_field = secure_field(cfg.get("openai_api_key", ""), row)
         row -= STEP
 
-        label("Realtime Model:", row)
+        label("Mic Model:", row)
         self._model_popup = popup(
             _MODELS, cfg.get("realtime_model", "gpt-realtime-translate"), row
+        )
+        row -= STEP
+
+        label("Speaker Model:", row)
+        self._speaker_model_popup = popup(
+            _MODELS, cfg.get("speaker_model", "gpt-realtime"), row
         )
         row -= STEP
 
@@ -185,6 +192,7 @@ class _SettingsController(NSObject):
         new_cfg = dict(self._config)
         new_cfg["openai_api_key"]        = str(self._api_field.stringValue()).strip()
         new_cfg["realtime_model"]         = str(self._model_popup.titleOfSelectedItem())
+        new_cfg["speaker_model"]          = str(self._speaker_model_popup.titleOfSelectedItem())
         new_cfg["input_device"]           = self._popup_val(self._input_popup)
         new_cfg["output_device"]          = self._popup_val(self._output_popup)
         new_cfg["mic_passthrough_device"] = self._popup_val(self._pt_popup)
@@ -286,12 +294,16 @@ class TranslateApp(rumps.App):
     def _start_speaker(self):
         if not self._require_api_key():
             return
+        spk_model = (
+            self.config.get("speaker_model")
+            or self.config.get("realtime_model", "")
+        )
         self._speaker_pipeline = SpeakerPipeline(
             api_key=self.config["openai_api_key"],
             capture_device_name=self.config.get("speaker_capture_device", "BlackHole 2ch"),
             output_device_name=self.config.get("output_device") or "",
             on_transcript=self.log_window.add_entry,
-            model=self.config.get("realtime_model", ""),
+            model=spk_model,
         )
         self._speaker_pipeline.start()
         self._speaker_active = True

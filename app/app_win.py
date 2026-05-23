@@ -113,15 +113,16 @@ class SettingsWindow:
             d["name"] for d in devices if d["max_output_channels"] > 0
         ]
 
-        # (label, config_key, options_list_or_None, widget_type)
+        # (label, config_key, options_list_or_None, widget_type, default_when_empty)
         rows = [
-            ("OpenAI API Key",            "openai_api_key",        None,         "password"),
-            ("Realtime Model",            "realtime_model",        _MODELS,      "combo"),
-            ("Real Microphone",           "input_device",          input_names,  "combo"),
-            ("Real Speaker",              "output_device",         output_names, "combo"),
-            ("Virtual Mic A – pass-thru", "mic_passthrough_device",output_names, "combo"),
-            ("Virtual Mic B – translated","mic_translated_device", output_names, "combo"),
-            ("Speaker Capture device",    "speaker_capture_device",input_names,  "combo"),
+            ("OpenAI API Key",            "openai_api_key",        None,         "password", ""),
+            ("Mic Model",                 "realtime_model",        _MODELS,      "combo",    "gpt-realtime-translate"),
+            ("Speaker Model",             "speaker_model",         _MODELS,      "combo",    "gpt-realtime"),
+            ("Real Microphone",           "input_device",          input_names,  "combo",    "(default)"),
+            ("Real Speaker",              "output_device",         output_names, "combo",    "(default)"),
+            ("Virtual Mic A – pass-thru", "mic_passthrough_device",output_names, "combo",    "(default)"),
+            ("Virtual Mic B – translated","mic_translated_device", output_names, "combo",    "(default)"),
+            ("Speaker Capture device",    "speaker_capture_device",input_names,  "combo",    "(default)"),
         ]
 
         frame = ttk.Frame(win, padding=16)
@@ -129,7 +130,7 @@ class SettingsWindow:
 
         _vars: dict[str, tk.StringVar] = {}
 
-        for i, (label, key, options, kind) in enumerate(rows):
+        for i, (label, key, options, kind, default_val) in enumerate(rows):
             ttk.Label(frame, text=label + ":").grid(
                 row=i, column=0, sticky=tk.W, pady=5, padx=(0, 10)
             )
@@ -140,7 +141,8 @@ class SettingsWindow:
                 entry = ttk.Entry(frame, textvariable=var, width=42, show="•")
                 entry.grid(row=i, column=1, sticky=tk.EW)
             else:
-                current = self._config.get(key, "") or "(default)"
+                config_val = self._config.get(key, "") or ""
+                current = config_val if config_val else default_val
                 cb = ttk.Combobox(
                     frame, textvariable=var,
                     values=options, width=40, state="readonly",
@@ -288,12 +290,16 @@ class TranslateApp:
     def _start_spk(self):
         if not self._require_api_key():
             return
+        spk_model = (
+            self.config.get("speaker_model")
+            or self.config.get("realtime_model", "")
+        )
         self._spk_pipeline = SpeakerPipeline(
             api_key=self.config["openai_api_key"],
             capture_device_name=self.config.get("speaker_capture_device", ""),
             output_device_name=self.config.get("output_device", ""),
             on_transcript=self.log_window.add_entry,
-            model=self.config.get("realtime_model", ""),
+            model=spk_model,
         )
         self._spk_pipeline.start()
         self._spk_active = True

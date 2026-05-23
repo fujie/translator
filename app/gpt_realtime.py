@@ -101,19 +101,7 @@ class RealtimeSession:
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        _requested = model or DEFAULT_MODEL
-        # gpt-realtime-translate is a one-way translation model — it cannot
-        # detect the source language or pass audio through unchanged.
-        # Speaker mode needs: EN→JP translation AND JP pass-through.
-        # Fall back to gpt-realtime which handles this via SPEAKER_SYSTEM_PROMPT.
-        if self.mode == "speaker" and _is_translate_model(_requested):
-            self.model = "gpt-realtime"
-            logger.info(
-                "[speaker] gpt-realtime-translate → using gpt-realtime "
-                "(translate model cannot do language-detection pass-through)"
-            )
-        else:
-            self.model = _requested
+        self.model = model or DEFAULT_MODEL
 
     # ------------------------------------------------------------------
     # Public interface (thread-safe)
