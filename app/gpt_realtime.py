@@ -64,25 +64,14 @@ VAD_CONFIG = {
     "silence_duration_ms": 500,
 }
 
-# ── Language config for gpt-realtime-translate ───────────────────────────────
+# ── Target language for gpt-realtime-translate ───────────────────────────────
 # mic mode    : Japanese → English
 # speaker mode: English → Japanese
-_TRANSLATE_SOURCE_LANG = {
-    "mic":     "ja",
-    "speaker": "en",
-}
+# NOTE: audio.input.language and audio.input.turn_detection are NOT accepted
+# by the /v1/realtime/translations endpoint — only audio.output.language works.
 _TRANSLATE_TARGET_LANG = {
     "mic":     "en",
     "speaker": "ja",
-}
-
-# VAD config used with gpt-realtime-translate
-# (server_vad improves turn detection accuracy for real-time translation)
-VAD_CONFIG_TRANSLATE = {
-    "type": "server_vad",
-    "threshold": 0.45,          # slightly sensitive for natural speech
-    "prefix_padding_ms": 200,   # capture leading consonants
-    "silence_duration_ms": 600, # wait a bit longer before cutting off
 }
 
 # Sentence-ending punctuation used to flush transcript buffers
@@ -165,23 +154,19 @@ class RealtimeSession:
 
     async def _configure_session(self, ws):
         if _is_translate_model(self.model):
-            # gpt-realtime-translate: source + target language hints + VAD
-            source_lang = _TRANSLATE_SOURCE_LANG.get(self.mode, "ja")
+            # gpt-realtime-translate: only audio.output.language is accepted.
+            # audio.input.language and audio.input.turn_detection are rejected
+            # by the translations endpoint as unknown parameters.
             target_lang = _TRANSLATE_TARGET_LANG.get(self.mode, "en")
             session = {
                 "audio": {
-                    "input": {
-                        "language":      source_lang,
-                        "turn_detection": VAD_CONFIG_TRANSLATE,
-                    },
                     "output": {
                         "language": target_lang,
                     },
                 }
             }
             logger.info(
-                f"[{self.mode}] translate mode → "
-                f"source={source_lang} target={target_lang}"
+                f"[{self.mode}] translate mode → target={target_lang}"
             )
         else:
             # gpt-realtime: full session config with instructions + VAD
