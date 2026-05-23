@@ -1,6 +1,6 @@
 {
   "openai_api_key": "sk-proj-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-  "realtime_model": "gpt-realtime",
+  "realtime_model": "gpt-realtime-translate",
   "input_device": "",
   "output_device": "",
   "mic_passthrough_device": "",

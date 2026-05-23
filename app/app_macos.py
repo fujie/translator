@@ -34,8 +34,8 @@ _SETTINGS_STYLE = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 _W, _H = 540, 430
 
 _MODELS = [
-    "gpt-realtime",
     "gpt-realtime-translate",
+    "gpt-realtime",
     "gpt-realtime-2",
     "gpt-realtime-mini",
 ]
@@ -129,7 +129,7 @@ class _SettingsController(NSObject):
 
         label("Realtime Model:", row)
         self._model_popup = popup(
-            _MODELS, cfg.get("realtime_model", "gpt-realtime"), row
+            _MODELS, cfg.get("realtime_model", "gpt-realtime-translate"), row
         )
         row -= STEP
 

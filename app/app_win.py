@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
 
 _MODELS = [
-    "gpt-realtime",
     "gpt-realtime-translate",
+    "gpt-realtime",
     "gpt-realtime-2",
     "gpt-realtime-mini",
 ]

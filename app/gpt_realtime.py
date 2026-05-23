@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 REALTIME_BASE_URL           = "wss://api.openai.com/v1/realtime"
 REALTIME_TRANSLATE_BASE_URL = "wss://api.openai.com/v1/realtime/translations"
-DEFAULT_MODEL = "gpt-realtime"
+DEFAULT_MODEL = "gpt-realtime-translate"
 SAMPLE_RATE = 24000
 CHANNELS = 1
 
@@ -64,12 +64,25 @@ VAD_CONFIG = {
     "silence_duration_ms": 500,
 }
 
-# ── Target language for gpt-realtime-translate ────────────────────────────────
+# ── Language config for gpt-realtime-translate ───────────────────────────────
 # mic mode    : Japanese → English
 # speaker mode: English → Japanese
+_TRANSLATE_SOURCE_LANG = {
+    "mic":     "ja",
+    "speaker": "en",
+}
 _TRANSLATE_TARGET_LANG = {
     "mic":     "en",
     "speaker": "ja",
+}
+
+# VAD config used with gpt-realtime-translate
+# (server_vad improves turn detection accuracy for real-time translation)
+VAD_CONFIG_TRANSLATE = {
+    "type": "server_vad",
+    "threshold": 0.45,          # slightly sensitive for natural speech
+    "prefix_padding_ms": 200,   # capture leading consonants
+    "silence_duration_ms": 600, # wait a bit longer before cutting off
 }
 
 # Sentence-ending punctuation used to flush transcript buffers
@@ -152,17 +165,23 @@ class RealtimeSession:
 
     async def _configure_session(self, ws):
         if _is_translate_model(self.model):
-            # gpt-realtime-translate: specify only the target output language
+            # gpt-realtime-translate: source + target language hints + VAD
+            source_lang = _TRANSLATE_SOURCE_LANG.get(self.mode, "ja")
             target_lang = _TRANSLATE_TARGET_LANG.get(self.mode, "en")
             session = {
                 "audio": {
+                    "input": {
+                        "language":      source_lang,
+                        "turn_detection": VAD_CONFIG_TRANSLATE,
+                    },
                     "output": {
                         "language": target_lang,
-                    }
+                    },
                 }
             }
             logger.info(
-                f"[{self.mode}] translate mode → target_language={target_lang}"
+                f"[{self.mode}] translate mode → "
+                f"source={source_lang} target={target_lang}"
             )
         else:
             # gpt-realtime: full session config with instructions + VAD
@@ -305,14 +324,36 @@ class RealtimeSession:
             elif etype == "session.output_transcript.delta":
                 delta = event.get("delta", "")
                 output_transcript += delta
-                # Flush on sentence boundary
+                # Flush eagerly on sentence boundary so log updates in real time
                 if delta and delta[-1] in _SENTENCE_END:
                     self._emit_transcript(input_transcript, output_transcript.strip())
                     input_transcript = output_transcript = ""
 
+            # ── Output transcript completed (flush remainder) ─────────
+            elif etype == "session.output_transcript.done":
+                done_text = event.get("transcript", "").strip() or output_transcript.strip()
+                if done_text:
+                    self._emit_transcript(input_transcript.strip(), done_text)
+                input_transcript = output_transcript = ""
+
             # ── Source text (input transcript) ────────────────────────
             elif etype == "session.input_transcript.delta":
                 input_transcript += event.get("delta", "")
+
+            # ── Input transcript completed ────────────────────────────
+            elif etype == "session.input_transcript.done":
+                done_text = event.get("transcript", "").strip()
+                if done_text:
+                    input_transcript = done_text  # overwrite with authoritative value
+
+            # ── Turn ended — audio output finished for this utterance ─
+            elif etype == "session.output_audio.done":
+                # Final flush if transcript events haven't already flushed
+                if input_transcript or output_transcript:
+                    self._emit_transcript(
+                        input_transcript.strip(), output_transcript.strip()
+                    )
+                    input_transcript = output_transcript = ""
 
             # ── Session closed (flush any remaining transcript) ───────
             elif etype == "session.closed":
