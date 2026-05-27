@@ -26,6 +26,8 @@ import certifi
 import websockets
 from websockets.asyncio.client import ClientConnection
 
+from context_manager import build_context_prompt
+
 _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 logger = logging.getLogger(__name__)
@@ -91,10 +93,12 @@ class RealtimeSession:
         on_audio: Callable[[bytes], None],
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = DEFAULT_MODEL,
+        context: str = "",
     ):
-        self.api_key      = api_key
-        self.mode         = mode
-        self.on_audio     = on_audio
+        self.api_key       = api_key
+        self.mode          = mode
+        self.context       = context   # free-form translation context text
+        self.on_audio      = on_audio
         self.on_transcript = on_transcript
         self._ws: Optional[ClientConnection] = None
         self._running = False
@@ -156,8 +160,12 @@ class RealtimeSession:
     async def _configure_session(self, ws):
         if _is_translate_model(self.model):
             # gpt-realtime-translate: only audio.output.language is accepted.
-            # audio.input.language and audio.input.turn_detection are rejected
-            # by the translations endpoint as unknown parameters.
+            # Instructions / context cannot be injected into this endpoint.
+            if self.context:
+                logger.info(
+                    f"[{self.mode}] context ignored — "
+                    "gpt-realtime-translate does not support instructions"
+                )
             target_lang = _TRANSLATE_TARGET_LANG.get(self.mode, "en")
             session = {
                 "audio": {
@@ -170,14 +178,21 @@ class RealtimeSession:
                 f"[{self.mode}] translate mode → target={target_lang}"
             )
         else:
-            # gpt-realtime: full session config with instructions + VAD
-            instructions = (
+            # gpt-realtime / gpt-realtime-2: prepend context to instructions
+            context_block = build_context_prompt(self.context)
+            base_prompt = (
                 MIC_SYSTEM_PROMPT if self.mode == "mic" else SPEAKER_SYSTEM_PROMPT
             )
+            instructions = context_block + base_prompt
+            if context_block:
+                logger.info(
+                    f"[{self.mode}] context injected "
+                    f"({len(self.context)} chars)"
+                )
             session = {
                 "type": "realtime",
                 "output_modalities": ["audio"],
-                "instructions": instructions,
+                "instructions": instructions,  # includes context block if set
                 "audio": {
                     "input":  {"turn_detection": VAD_CONFIG},
                     "output": {"format": {"type": "audio/pcm", "rate": SAMPLE_RATE}},

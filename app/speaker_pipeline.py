@@ -41,12 +41,14 @@ class SpeakerPipeline:
         output_device_name: str,
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = "",
+        context: str = "",
     ):
         self.api_key = api_key
         self.capture_device_name = capture_device_name
         self.output_device_name = output_device_name
         self.on_transcript = on_transcript
         self.model = model
+        self.context = context
 
         self._running = False
         self._session: Optional[RealtimeSession] = None
@@ -104,6 +106,8 @@ class SpeakerPipeline:
             return  # named device not found
 
         kw = {"model": self.model} if self.model else {}
+        if self.context:
+            kw["context"] = self.context
         self._session = RealtimeSession(
             api_key=self.api_key,
             mode="speaker",

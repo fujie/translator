@@ -40,6 +40,7 @@ class MicPipeline:
         translated_device_name: str,
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = "",
+        context: str = "",
     ):
         self.api_key = api_key
         self.input_device_name = input_device_name
@@ -47,6 +48,7 @@ class MicPipeline:
         self.translated_device_name = translated_device_name
         self.on_transcript = on_transcript
         self.model = model
+        self.context = context
 
         self._running = False
         self._session: Optional[RealtimeSession] = None
@@ -111,6 +113,8 @@ class MicPipeline:
             return
 
         kw = {"model": self.model} if self.model else {}
+        if self.context:
+            kw["context"] = self.context
         self._session = RealtimeSession(
             api_key=self.api_key,
             mode="mic",

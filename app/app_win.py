@@ -34,6 +34,7 @@ from audio_devices import list_devices
 from mic_pipeline import MicPipeline
 from speaker_pipeline import SpeakerPipeline
 from log_window import LogWindow
+from context_window import ContextWindow
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +216,14 @@ class TranslateApp:
         mic_label = "🎙 Mic: ON " if self._mic_active else "🎙 Mic: OFF"
         spk_label = "🔊 Speaker: ON " if self._spk_active else "🔊 Speaker: OFF"
         return pystray.Menu(
-            pystray.MenuItem(mic_label,          self._cb_toggle_mic),
-            pystray.MenuItem(spk_label,          self._cb_toggle_spk),
+            pystray.MenuItem(mic_label,              self._cb_toggle_mic),
+            pystray.MenuItem(spk_label,              self._cb_toggle_spk),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Translation Log…", self._cb_open_log),
-            pystray.MenuItem("Settings…",        self._cb_open_settings),
+            pystray.MenuItem("Translation Log…",     self._cb_open_log),
+            pystray.MenuItem("Translation Context…", self._cb_open_context),
+            pystray.MenuItem("Settings…",            self._cb_open_settings),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",             self._cb_quit),
+            pystray.MenuItem("Quit",                 self._cb_quit),
         )
 
     def _refresh_tray(self):
@@ -241,6 +243,9 @@ class TranslateApp:
 
     def _cb_open_log(self, *_):
         self._root.after(0, self.log_window.show)
+
+    def _cb_open_context(self, *_):
+        self._root.after(0, self._open_context)
 
     def _cb_open_settings(self, *_):
         self._root.after(0, self._open_settings)
@@ -274,6 +279,7 @@ class TranslateApp:
             translated_device_name=self.config.get("mic_translated_device", ""),
             on_transcript=self.log_window.add_entry,
             model=self.config.get("realtime_model", ""),
+            context=self.config.get("context_text", ""),
         )
         self._mic_pipeline.start()
         self._mic_active = True
@@ -300,6 +306,7 @@ class TranslateApp:
             output_device_name=self.config.get("output_device", ""),
             on_transcript=self.log_window.add_entry,
             model=spk_model,
+            context=self.config.get("context_text", ""),
         )
         self._spk_pipeline.start()
         self._spk_active = True
@@ -322,6 +329,17 @@ class TranslateApp:
             )
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # Translation Context
+    # ------------------------------------------------------------------
+
+    def _open_context(self):
+        ContextWindow(self._root, self.config, self._on_context_saved).show()
+
+    def _on_context_saved(self, new_cfg: dict):
+        self.config = new_cfg
+        save_config(new_cfg)
 
     # ------------------------------------------------------------------
     # Settings

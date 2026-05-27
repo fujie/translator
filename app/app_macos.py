@@ -25,6 +25,7 @@ from audio_devices import list_devices
 from mic_pipeline import MicPipeline
 from speaker_pipeline import SpeakerPipeline
 from log_window_macos import LogWindow
+from context_window_macos import ContextWindowController
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,7 @@ class TranslateApp(rumps.App):
         self._mic_active = False
         self._speaker_active = False
         self._settings_ctrl: _SettingsController | None = None
+        self._context_ctrl: ContextWindowController | None = None
 
         self.mic_item     = rumps.MenuItem("🎙 Mic: OFF",     callback=self.toggle_mic)
         self.speaker_item = rumps.MenuItem("🔊 Speaker: OFF", callback=self.toggle_speaker)
@@ -235,10 +237,11 @@ class TranslateApp(rumps.App):
             self.mic_item,
             self.speaker_item,
             None,
-            rumps.MenuItem("Translation Log…", callback=self.open_log),
-            rumps.MenuItem("Settings…",        callback=self.open_settings),
+            rumps.MenuItem("Translation Log…",     callback=self.open_log),
+            rumps.MenuItem("Translation Context…", callback=self.open_context),
+            rumps.MenuItem("Settings…",            callback=self.open_settings),
             None,
-            rumps.MenuItem("Quit",             callback=self.quit_app),
+            rumps.MenuItem("Quit",                 callback=self.quit_app),
         ]
 
         self._poll_timer = rumps.Timer(self._poll_log, 0.2)
@@ -276,6 +279,7 @@ class TranslateApp(rumps.App):
             translated_device_name=self.config.get("mic_translated_device", "BlackHole 16ch"),
             on_transcript=self.log_window.add_entry,
             model=self.config.get("realtime_model", ""),
+            context=self.config.get("context_text", ""),
         )
         self._mic_pipeline.start()
         self._mic_active = True
@@ -304,6 +308,7 @@ class TranslateApp(rumps.App):
             output_device_name=self.config.get("output_device") or "",
             on_transcript=self.log_window.add_entry,
             model=spk_model,
+            context=self.config.get("context_text", ""),
         )
         self._speaker_pipeline.start()
         self._speaker_active = True
@@ -337,6 +342,16 @@ class TranslateApp(rumps.App):
 
     def open_log(self, _):
         self.log_window.show()
+
+    def open_context(self, _):
+        self._context_ctrl = ContextWindowController.alloc().initWithConfig_onSave_(
+            dict(self.config),
+            self._on_context_saved,
+        )
+
+    def _on_context_saved(self, new_cfg: dict):
+        self.config = new_cfg
+        save_config(new_cfg)
 
     def open_settings(self, _):
         def on_save(new_cfg):

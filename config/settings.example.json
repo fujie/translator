@@ -7,6 +7,7 @@
   "mic_passthrough_device": "",
   "mic_translated_device": "BlackHole 16ch",
   "speaker_capture_device": "BlackHole 2ch",
+  "context_text": "",
   "log_max_entries": 200,
   "source_language": "ja",
   "target_language_mic": "en",
