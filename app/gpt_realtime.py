@@ -94,12 +94,14 @@ class RealtimeSession:
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = DEFAULT_MODEL,
         context: str = "",
+        on_transcript_delta: Optional[Callable[[str, str, str], None]] = None,
     ):
-        self.api_key       = api_key
-        self.mode          = mode
-        self.context       = context   # free-form translation context text
-        self.on_audio      = on_audio
-        self.on_transcript = on_transcript
+        self.api_key              = api_key
+        self.mode                 = mode
+        self.context              = context
+        self.on_audio             = on_audio
+        self.on_transcript        = on_transcript
+        self.on_transcript_delta  = on_transcript_delta  # (direction, src_delta, tgt_delta)
         self._ws: Optional[ClientConnection] = None
         self._running = False
         self._send_queue: asyncio.Queue = asyncio.Queue()
@@ -193,6 +195,7 @@ class RealtimeSession:
                 "type": "realtime",
                 "output_modalities": ["audio"],
                 "instructions": instructions,  # includes context block if set
+                "input_audio_transcription": {"model": "whisper-1"},
                 "audio": {
                     "input":  {"turn_detection": VAD_CONFIG},
                     "output": {"format": {"type": "audio/pcm", "rate": SAMPLE_RATE}},
@@ -252,8 +255,25 @@ class RealtimeSession:
                 if audio_b64:
                     self.on_audio(base64.b64decode(audio_b64))
 
+            elif etype == "conversation.item.input_audio_transcription.delta":
+                # Streaming input (source) transcription delta — whisper-1
+                delta = event.get("delta", "")
+                if delta:
+                    input_transcript += delta
+                    self._emit_delta(delta, "")
+
             elif etype == "conversation.item.input_audio_transcription.completed":
+                # Authoritative completed input transcript
                 input_transcript = event.get("transcript", "")
+
+            elif etype in (
+                "response.output_audio_transcript.delta",
+                "response.audio_transcript.delta",
+            ):
+                # Streaming output (translated) transcription delta
+                delta = event.get("delta", "")
+                if delta:
+                    self._emit_delta("", delta)
 
             elif etype in (
                 "response.output_audio_transcript.done",
@@ -285,8 +305,6 @@ class RealtimeSession:
                 "response.content_part.added",
                 "response.content_part.done",
                 "response.output_audio.done",
-                "response.output_audio_transcript.delta",
-                "response.audio_transcript.delta",
                 "response.text.delta",
                 "response.text.done",
                 "rate_limits.updated",
@@ -324,11 +342,13 @@ class RealtimeSession:
             # ── Translated text (output transcript) ───────────────────
             elif etype == "session.output_transcript.delta":
                 delta = event.get("delta", "")
-                output_transcript += delta
-                # Flush eagerly on sentence boundary so log updates in real time
-                if delta and delta[-1] in _SENTENCE_END:
-                    self._emit_transcript(input_transcript, output_transcript.strip())
-                    input_transcript = output_transcript = ""
+                if delta:
+                    output_transcript += delta
+                    self._emit_delta("", delta)
+                    # Flush eagerly on sentence boundary so log updates in real time
+                    if delta[-1] in _SENTENCE_END:
+                        self._emit_transcript(input_transcript, output_transcript.strip())
+                        input_transcript = output_transcript = ""
 
             # ── Output transcript completed (flush remainder) ─────────
             elif etype == "session.output_transcript.done":
@@ -339,7 +359,10 @@ class RealtimeSession:
 
             # ── Source text (input transcript) ────────────────────────
             elif etype == "session.input_transcript.delta":
-                input_transcript += event.get("delta", "")
+                delta = event.get("delta", "")
+                if delta:
+                    input_transcript += delta
+                    self._emit_delta(delta, "")
 
             # ── Input transcript completed ────────────────────────────
             elif etype == "session.input_transcript.done":
@@ -380,3 +403,8 @@ class RealtimeSession:
         if self.on_transcript and (original or translated):
             direction = "↑ local" if self.mode == "mic" else "↓ remote"
             self.on_transcript(direction, original, translated)
+
+    def _emit_delta(self, src_delta: str, tgt_delta: str):
+        if self.on_transcript_delta and (src_delta or tgt_delta):
+            direction = "↑ local" if self.mode == "mic" else "↓ remote"
+            self.on_transcript_delta(direction, src_delta, tgt_delta)

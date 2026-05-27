@@ -35,6 +35,7 @@ from mic_pipeline import MicPipeline
 from speaker_pipeline import SpeakerPipeline
 from log_window import LogWindow
 from context_window import ContextWindow
+from live_transcript_window import LiveTranscriptWindow
 
 logger = logging.getLogger(__name__)
 
@@ -196,8 +197,13 @@ class TranslateApp:
             self._root,
             max_entries=self.config.get("log_max_entries", 200),
         )
+        self.live_transcript = LiveTranscriptWindow(
+            self._root,
+            self.config,
+            self._on_mix_change,
+        )
 
-        # Poll log queue 5× per second from main thread
+        # Poll log + transcript queues 5× per second from main thread
         self._root.after(200, self._poll_log)
 
         # Build tray icon (pystray runs in its own daemon thread)
@@ -207,6 +213,7 @@ class TranslateApp:
             "Realtime Translate",
             menu=self._build_menu(),
         )
+
 
     # ------------------------------------------------------------------
     # Tray menu
@@ -220,6 +227,7 @@ class TranslateApp:
             pystray.MenuItem(spk_label,              self._cb_toggle_spk),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Translation Log…",     self._cb_open_log),
+            pystray.MenuItem("Live Transcript…",     self._cb_open_live_transcript),
             pystray.MenuItem("Translation Context…", self._cb_open_context),
             pystray.MenuItem("Settings…",            self._cb_open_settings),
             pystray.Menu.SEPARATOR,
@@ -243,6 +251,9 @@ class TranslateApp:
 
     def _cb_open_log(self, *_):
         self._root.after(0, self.log_window.show)
+
+    def _cb_open_live_transcript(self, *_):
+        self._root.after(0, self.live_transcript.show)
 
     def _cb_open_context(self, *_):
         self._root.after(0, self._open_context)
@@ -277,7 +288,8 @@ class TranslateApp:
             input_device_name=self.config.get("input_device", ""),
             passthrough_device_name=self.config.get("mic_passthrough_device", ""),
             translated_device_name=self.config.get("mic_translated_device", ""),
-            on_transcript=self.log_window.add_entry,
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
             model=self.config.get("realtime_model", ""),
             context=self.config.get("context_text", ""),
         )
@@ -300,13 +312,16 @@ class TranslateApp:
             self.config.get("speaker_model")
             or self.config.get("realtime_model", "")
         )
+        mix_ratio = self.config.get("speaker_mix_ratio", 100) / 100.0
         self._spk_pipeline = SpeakerPipeline(
             api_key=self.config["openai_api_key"],
             capture_device_name=self.config.get("speaker_capture_device", ""),
             output_device_name=self.config.get("output_device", ""),
-            on_transcript=self.log_window.add_entry,
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
             model=spk_model,
             context=self.config.get("context_text", ""),
+            mix_ratio=mix_ratio,
         )
         self._spk_pipeline.start()
         self._spk_active = True
@@ -319,6 +334,18 @@ class TranslateApp:
             self._spk_pipeline = None
         self._spk_active = False
         self._refresh_tray()
+
+    def _on_transcript(self, direction: str, src: str, tgt: str):
+        """Route completed utterances to both the log window and the live transcript."""
+        self.log_window.add_entry(direction, src, tgt)
+        self.live_transcript.commit(direction, src, tgt)
+
+    def _on_mix_change(self, ratio: float):
+        """Called by the live transcript mix slider; updates the active pipeline and persists."""
+        if self._spk_pipeline:
+            self._spk_pipeline.set_mix_ratio(ratio)
+        self.config["speaker_mix_ratio"] = int(round(ratio * 100))
+        save_config(self.config)
 
     def _require_api_key(self) -> bool:
         if not self.config.get("openai_api_key"):
@@ -372,6 +399,7 @@ class TranslateApp:
 
     def _poll_log(self):
         self.log_window.poll()
+        self.live_transcript.poll()
         self._root.after(200, self._poll_log)
 
     def _quit(self):

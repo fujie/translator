@@ -26,6 +26,7 @@ from mic_pipeline import MicPipeline
 from speaker_pipeline import SpeakerPipeline
 from log_window_macos import LogWindow
 from context_window_macos import ContextWindowController
+from live_transcript_window_macos import LiveTranscriptWindow
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,7 @@ class TranslateApp(rumps.App):
 
         self.config = load_config()
         self.log_window = LogWindow(max_entries=self.config.get("log_max_entries", 200))
+        self.live_transcript = LiveTranscriptWindow(self.config, self._on_mix_change)
 
         self._mic_pipeline: MicPipeline | None = None
         self._speaker_pipeline: SpeakerPipeline | None = None
@@ -238,6 +240,7 @@ class TranslateApp(rumps.App):
             self.speaker_item,
             None,
             rumps.MenuItem("Translation Log…",     callback=self.open_log),
+            rumps.MenuItem("Live Transcript…",     callback=self.open_live_transcript),
             rumps.MenuItem("Translation Context…", callback=self.open_context),
             rumps.MenuItem("Settings…",            callback=self.open_settings),
             None,
@@ -277,7 +280,8 @@ class TranslateApp(rumps.App):
             input_device_name=self.config.get("input_device") or "",
             passthrough_device_name=self.config.get("mic_passthrough_device") or "",
             translated_device_name=self.config.get("mic_translated_device", "BlackHole 16ch"),
-            on_transcript=self.log_window.add_entry,
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
             model=self.config.get("realtime_model", ""),
             context=self.config.get("context_text", ""),
         )
@@ -302,13 +306,16 @@ class TranslateApp(rumps.App):
             self.config.get("speaker_model")
             or self.config.get("realtime_model", "")
         )
+        mix_ratio = self.config.get("speaker_mix_ratio", 100) / 100.0
         self._speaker_pipeline = SpeakerPipeline(
             api_key=self.config["openai_api_key"],
             capture_device_name=self.config.get("speaker_capture_device", "BlackHole 2ch"),
             output_device_name=self.config.get("output_device") or "",
-            on_transcript=self.log_window.add_entry,
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
             model=spk_model,
             context=self.config.get("context_text", ""),
+            mix_ratio=mix_ratio,
         )
         self._speaker_pipeline.start()
         self._speaker_active = True
@@ -342,6 +349,21 @@ class TranslateApp(rumps.App):
 
     def open_log(self, _):
         self.log_window.show()
+
+    def open_live_transcript(self, _):
+        self.live_transcript.show()
+
+    def _on_transcript(self, direction: str, src: str, tgt: str):
+        """Route completed utterances to both the log window and the live transcript."""
+        self.log_window.add_entry(direction, src, tgt)
+        self.live_transcript.commit(direction, src, tgt)
+
+    def _on_mix_change(self, ratio: float):
+        """Called by the live transcript mix slider; updates the active pipeline and persists."""
+        if self._speaker_pipeline:
+            self._speaker_pipeline.set_mix_ratio(ratio)
+        self.config["speaker_mix_ratio"] = int(round(ratio * 100))
+        save_config(self.config)
 
     def open_context(self, _):
         self._context_ctrl = ContextWindowController.alloc().initWithConfig_onSave_(
@@ -380,3 +402,4 @@ class TranslateApp(rumps.App):
 
     def _poll_log(self, _):
         self.log_window.poll()
+        self.live_transcript.poll()

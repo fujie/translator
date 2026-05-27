@@ -9,6 +9,7 @@ GPT system prompt handles language logic:
 """
 import asyncio
 import logging
+import queue as _queue
 import threading
 from typing import Callable, Optional
 
@@ -42,6 +43,8 @@ class SpeakerPipeline:
         on_transcript: Optional[Callable[[str, str, str], None]] = None,
         model: str = "",
         context: str = "",
+        on_transcript_delta: Optional[Callable[[str, str, str], None]] = None,
+        mix_ratio: float = 1.0,
     ):
         self.api_key = api_key
         self.capture_device_name = capture_device_name
@@ -49,14 +52,25 @@ class SpeakerPipeline:
         self.on_transcript = on_transcript
         self.model = model
         self.context = context
+        self.on_transcript_delta = on_transcript_delta
+        self._mix_ratio = max(0.0, min(1.0, mix_ratio))
 
         self._running = False
         self._session: Optional[RealtimeSession] = None
         self._capture_in: Optional[sd.InputStream] = None
         self._output_out: Optional[sd.OutputStream] = None
+        self._orig_monitor_out: Optional[sd.OutputStream] = None  # original audio at (1-ratio) vol
+        self._orig_queue: _queue.Queue = _queue.Queue(maxsize=50)
+        self._drain_thread: Optional[threading.Thread] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_task: Optional[asyncio.Task] = None
+
+    # ------------------------------------------------------------------
+
+    def set_mix_ratio(self, ratio: float):
+        """Update the original/translated audio mix ratio (0.0 = original only, 1.0 = translated only)."""
+        self._mix_ratio = max(0.0, min(1.0, ratio))
 
     # ------------------------------------------------------------------
 
@@ -64,6 +78,8 @@ class SpeakerPipeline:
         if self._running:
             return
         self._running = True
+        self._drain_thread = threading.Thread(target=self._drain_orig, daemon=True)
+        self._drain_thread.start()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -108,6 +124,8 @@ class SpeakerPipeline:
         kw = {"model": self.model} if self.model else {}
         if self.context:
             kw["context"] = self.context
+        if self.on_transcript_delta:
+            kw["on_transcript_delta"] = self.on_transcript_delta
         self._session = RealtimeSession(
             api_key=self.api_key,
             mode="speaker",
@@ -132,6 +150,13 @@ class SpeakerPipeline:
                             channels=CHANNELS,
                             dtype="int16",
                         )
+                        # Second stream on the same device for original audio monitor
+                        self._orig_monitor_out = sd.OutputStream(
+                            device=output_idx,
+                            samplerate=SAMPLE_RATE,
+                            channels=CHANNELS,
+                            dtype="int16",
+                        )
                         self._capture_in = sd.InputStream(
                             device=capture_idx,
                             samplerate=SAMPLE_RATE,
@@ -141,6 +166,7 @@ class SpeakerPipeline:
                             callback=self._audio_callback,
                         )
                         self._output_out.start()
+                        self._orig_monitor_out.start()
                         self._capture_in.start()
                     return  # success
                 except Exception as exc:
@@ -160,14 +186,38 @@ class SpeakerPipeline:
             logger.warning(f"Speaker capture status: {status}")
         if self._session:
             self._session.send_audio(indata.tobytes())
+        # Route original audio to monitor mix at (1 - mix_ratio) volume
+        orig_vol = 1.0 - self._mix_ratio
+        if orig_vol > 0.001 and self._orig_monitor_out:
+            arr = (indata.astype(np.float32) * orig_vol).clip(-32768, 32767).astype(np.int16)
+            try:
+                self._orig_queue.put_nowait(arr)
+            except _queue.Full:
+                pass  # drop frame rather than stall the callback
+
+    def _drain_orig(self):
+        """Background thread: drains _orig_queue → _orig_monitor_out."""
+        while self._running:
+            try:
+                arr = self._orig_queue.get(timeout=0.1)
+            except _queue.Empty:
+                continue
+            if self._orig_monitor_out and self._orig_monitor_out.active:
+                try:
+                    self._orig_monitor_out.write(arr)
+                except Exception as e:
+                    logger.debug(f"orig monitor write: {e}")
 
     def _on_translated_audio(self, pcm16: bytes):
         if self._output_out and self._output_out.active:
             arr = np.frombuffer(pcm16, dtype=np.int16).reshape(-1, CHANNELS)
+            # Scale to mix_ratio volume (skip float conversion when ratio is 1.0)
+            if self._mix_ratio < 0.999:
+                arr = (arr.astype(np.float32) * self._mix_ratio).clip(-32768, 32767).astype(np.int16)
             self._output_out.write(arr)
 
     def cleanup(self):
-        for s in [self._capture_in, self._output_out]:
+        for s in [self._capture_in, self._output_out, self._orig_monitor_out]:
             if s:
                 try:
                     s.stop()
