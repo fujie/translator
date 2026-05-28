@@ -16,7 +16,7 @@ from AppKit import (
     NSWindow, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
     NSBackingStoreBuffered,
     NSTextField, NSSecureTextField, NSPopUpButton, NSButton,
-    NSFont, NSApplication, NSColor,
+    NSFont, NSApplication, NSColor, NSOpenPanel,
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -27,6 +27,7 @@ from speaker_pipeline import SpeakerPipeline
 from log_window_macos import LogWindow
 from context_window_macos import ContextWindowController
 from live_transcript_window_macos import LiveTranscriptWindow
+from file_pipeline import FilePipeline, check_ffmpeg
 
 logger = logging.getLogger(__name__)
 
@@ -225,19 +226,27 @@ class TranslateApp(rumps.App):
         self.log_window = LogWindow(max_entries=self.config.get("log_max_entries", 200))
         self.live_transcript = LiveTranscriptWindow(self.config, self._on_mix_change)
 
-        self._mic_pipeline: MicPipeline | None = None
+        self._mic_pipeline:     MicPipeline     | None = None
         self._speaker_pipeline: SpeakerPipeline | None = None
-        self._mic_active = False
+        self._file_pipeline:    FilePipeline    | None = None
+        self._mic_active     = False
         self._speaker_active = False
-        self._settings_ctrl: _SettingsController | None = None
-        self._context_ctrl: ContextWindowController | None = None
+        self._file_active    = False
+        self._file_complete_pending = False
+        self._settings_ctrl: _SettingsController   | None = None
+        self._context_ctrl:  ContextWindowController | None = None
 
-        self.mic_item     = rumps.MenuItem("🎙 Mic: OFF",     callback=self.toggle_mic)
-        self.speaker_item = rumps.MenuItem("🔊 Speaker: OFF", callback=self.toggle_speaker)
+        self.mic_item      = rumps.MenuItem("🎙 Mic: OFF",     callback=self.toggle_mic)
+        self.speaker_item  = rumps.MenuItem("🔊 Speaker: OFF", callback=self.toggle_speaker)
+        self.file_mic_item = rumps.MenuItem("📂 Test File – Mic…",     callback=self.open_test_file_mic)
+        self.file_spk_item = rumps.MenuItem("📂 Test File – Speaker…", callback=self.open_test_file_spk)
 
         self.menu = [
             self.mic_item,
             self.speaker_item,
+            None,
+            self.file_mic_item,
+            self.file_spk_item,
             None,
             rumps.MenuItem("Translation Log…",     callback=self.open_log),
             rumps.MenuItem("Live Transcript…",     callback=self.open_live_transcript),
@@ -347,6 +356,87 @@ class TranslateApp(rumps.App):
         else:
             self.title = "🌐"
 
+    # ── File-based translation test ───────────────────────────────────
+
+    def open_test_file_mic(self, _):
+        if self._file_active:
+            self._stop_file_test()
+        else:
+            self._open_file_picker("mic")
+
+    def open_test_file_spk(self, _):
+        if self._file_active:
+            self._stop_file_test()
+        else:
+            self._open_file_picker("speaker")
+
+    def _open_file_picker(self, mode: str):
+        if not self._require_api_key():
+            return
+        mode_label = "マイク (JP→EN)" if mode == "mic" else "スピーカー (EN→JP)"
+        panel = NSOpenPanel.openPanel()
+        panel.setTitle_(f"翻訳テスト – {mode_label} モード")
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_([
+            "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus",
+            "mp4", "mov", "mkv", "webm", "avi",
+        ])
+        if panel.runModal() != 1:
+            return
+        path = str(panel.URL().path())
+        self._start_file_test(path, mode)
+
+    def _start_file_test(self, path: str, mode: str):
+        # Stop any existing file test first
+        if self._file_active:
+            self._stop_file_test()
+        model = (
+            self.config.get("realtime_model", "") if mode == "mic"
+            else (self.config.get("speaker_model") or self.config.get("realtime_model", ""))
+        )
+        self._file_pipeline = FilePipeline(
+            api_key=self.config["openai_api_key"],
+            file_path=path,
+            mode=mode,
+            output_device_name=self.config.get("output_device") or "",
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
+            model=model,
+            context=self.config.get("context_text", ""),
+            on_complete=self._on_file_test_complete,
+        )
+        try:
+            self._file_pipeline.start()
+        except RuntimeError as e:
+            rumps.alert(str(e))
+            self._file_pipeline = None
+            return
+        self._file_active = True
+        self._update_file_items()
+        self.live_transcript.show()
+
+    def _stop_file_test(self):
+        if self._file_pipeline:
+            self._file_pipeline.stop()
+            self._file_pipeline.cleanup()
+            self._file_pipeline = None
+        self._file_active = False
+        self._update_file_items()
+
+    def _update_file_items(self):
+        if self._file_active:
+            self.file_mic_item.title = "⏹ Stop File Test"
+            self.file_spk_item.title = "⏹ Stop File Test"
+        else:
+            self.file_mic_item.title = "📂 Test File – Mic…"
+            self.file_spk_item.title = "📂 Test File – Speaker…"
+
+    def _on_file_test_complete(self):
+        # Called from pipeline thread — defer UI update to poll timer (main thread)
+        self._file_complete_pending = True
+
+    # ── Log / Transcript windows ──────────────────────────────────────
+
     def open_log(self, _):
         self.log_window.show()
 
@@ -403,3 +493,6 @@ class TranslateApp(rumps.App):
     def _poll_log(self, _):
         self.log_window.poll()
         self.live_transcript.poll()
+        if self._file_complete_pending:
+            self._file_complete_pending = False
+            self._stop_file_test()   # reset UI; pipeline already finished

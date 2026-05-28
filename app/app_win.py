@@ -36,6 +36,7 @@ from speaker_pipeline import SpeakerPipeline
 from log_window import LogWindow
 from context_window import ContextWindow
 from live_transcript_window import LiveTranscriptWindow
+from file_pipeline import FilePipeline, check_ffmpeg
 
 logger = logging.getLogger(__name__)
 
@@ -183,10 +184,12 @@ class TranslateApp:
     def __init__(self):
         self.config = load_config()
 
-        self._mic_active = False
-        self._spk_active = False
-        self._mic_pipeline: Optional[MicPipeline] = None
-        self._spk_pipeline: Optional[SpeakerPipeline] = None
+        self._mic_active  = False
+        self._spk_active  = False
+        self._file_active = False
+        self._mic_pipeline:  Optional[MicPipeline]   = None
+        self._spk_pipeline:  Optional[SpeakerPipeline] = None
+        self._file_pipeline: Optional[FilePipeline]  = None
 
         # Hidden tkinter root — all UI lives on this thread
         self._root = tk.Tk()
@@ -222,9 +225,14 @@ class TranslateApp:
     def _build_menu(self) -> pystray.Menu:
         mic_label = "🎙 Mic: ON " if self._mic_active else "🎙 Mic: OFF"
         spk_label = "🔊 Speaker: ON " if self._spk_active else "🔊 Speaker: OFF"
+        file_mic_label = "⏹ Stop File Test" if self._file_active else "📂 Test File – Mic…"
+        file_spk_label = "⏹ Stop File Test" if self._file_active else "📂 Test File – Speaker…"
         return pystray.Menu(
             pystray.MenuItem(mic_label,              self._cb_toggle_mic),
             pystray.MenuItem(spk_label,              self._cb_toggle_spk),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(file_mic_label,         self._cb_test_file_mic),
+            pystray.MenuItem(file_spk_label,         self._cb_test_file_spk),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Translation Log…",     self._cb_open_log),
             pystray.MenuItem("Live Transcript…",     self._cb_open_live_transcript),
@@ -254,6 +262,12 @@ class TranslateApp:
 
     def _cb_open_live_transcript(self, *_):
         self._root.after(0, self.live_transcript.show)
+
+    def _cb_test_file_mic(self, *_):
+        self._root.after(0, lambda: self._handle_test_file("mic"))
+
+    def _cb_test_file_spk(self, *_):
+        self._root.after(0, lambda: self._handle_test_file("speaker"))
 
     def _cb_open_context(self, *_):
         self._root.after(0, self._open_context)
@@ -346,6 +360,67 @@ class TranslateApp:
             self._spk_pipeline.set_mix_ratio(ratio)
         self.config["speaker_mix_ratio"] = int(round(ratio * 100))
         save_config(self.config)
+
+    # ── File-based translation test ────────────────────────────────────
+
+    def _handle_test_file(self, mode: str):
+        """Called on main thread when a file-test menu item is clicked."""
+        if self._file_active:
+            self._stop_file_test()
+            return
+        mode_label = "マイク (JP→EN)" if mode == "mic" else "スピーカー (EN→JP)"
+        path = filedialog.askopenfilename(
+            title=f"翻訳テスト – {mode_label} モード",
+            filetypes=[
+                ("Audio/Video", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus "
+                                "*.mp4 *.mov *.mkv *.webm *.avi"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self._start_file_test(path, mode)
+
+    def _start_file_test(self, path: str, mode: str):
+        if not self._require_api_key():
+            return
+        model = (
+            self.config.get("realtime_model", "") if mode == "mic"
+            else (self.config.get("speaker_model") or self.config.get("realtime_model", ""))
+        )
+        self._file_pipeline = FilePipeline(
+            api_key=self.config["openai_api_key"],
+            file_path=path,
+            mode=mode,
+            output_device_name=self.config.get("output_device", ""),
+            on_transcript=self._on_transcript,
+            on_transcript_delta=self.live_transcript.add_delta,
+            model=model,
+            context=self.config.get("context_text", ""),
+            on_complete=self._on_file_test_complete,
+        )
+        try:
+            self._file_pipeline.start()
+        except RuntimeError as e:
+            from tkinter import messagebox
+            messagebox.showerror("ffmpeg が必要です", str(e))
+            self._file_pipeline = None
+            return
+        self._file_active = True
+        self._refresh_tray()
+        self.live_transcript.show()
+
+    def _stop_file_test(self):
+        if self._file_pipeline:
+            self._file_pipeline.stop()
+            self._file_pipeline.cleanup()
+            self._file_pipeline = None
+        self._file_active = False
+        self._refresh_tray()
+
+    def _on_file_test_complete(self):
+        # Called from pipeline thread — dispatch to tkinter main thread
+        self._root.after(0, self._stop_file_test)
 
     def _require_api_key(self) -> bool:
         if not self.config.get("openai_api_key"):
